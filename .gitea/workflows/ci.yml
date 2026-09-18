@@ -116,12 +116,20 @@ jobs:
           #   `set -e` tue l'étape — sans une ligne de sortie pour l'expliquer.
           #   C'est exactement ce qui est arrivé au premier essai sur
           #   Automatisation-Python-Bash. Un `if` sans `else` rend 0.
+          #
+          # La reconnaissance du shebang porte sur le NOM DE L'INTERPRÉTEUR, pas
+          # sur la fin de la ligne. Le motif précédent — `(bash|/sh$|env sh)` —
+          # ratait « #!/bin/sh -e » : la ligne finit par « -e », donc `/sh$` ne
+          # mordait pas, et un script POSIX qui s'arrête à la première erreur
+          # échappait à shellcheck comme au décompte. zsh reste exclu, shellcheck
+          # ne sait pas l'analyser.
           {
             git ls-files '*.sh' '*.bash'
             git ls-files | while IFS= read -r f; do
               [ -f "$f" ] || continue
               head -c 2 "$f" 2>/dev/null | grep -q '^#!' || continue
-              if head -n 1 "$f" | grep -qE '(bash|/sh$|env sh)'; then
+              if head -n 1 "$f" \
+                 | grep -qE '^#!([^ ]*/)?(env[[:space:]]+)?(bash|sh|dash|ksh)([[:space:]]|$)'; then
                 printf '%s\n' "$f"
               fi
             done
@@ -136,7 +144,18 @@ jobs:
 
           # Un dépôt quasi vide n'est pas une erreur, mais il faut le dire :
           # sinon une CI verte laisse croire que quelque chose a été vérifié.
-          echo "total=$(git ls-files | grep -c . || true)" >> "$GITHUB_OUTPUT"
+          # Le commentaire disait déjà ça et ne le faisait pas — Noosphere ne
+          # compte que trois fichiers versionnés et rendait un vert muet.
+          TOTAL=$(git ls-files | grep -c . || true)
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+          if [ $((YAML + JSON + TOML + PY + SH)) -eq 0 ]; then
+            echo "vide=oui" >> "$GITHUB_OUTPUT"
+            echo "⚠ AUCUN fichier de code ou de configuration versionné."
+            echo "  Seul le scan de secrets a quelque chose à dire ici ;"
+            echo "  le vert de ce job ne veut rien dire d'autre."
+          else
+            echo "vide=non" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Installer uv
         uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc  # v6.4.3
@@ -166,9 +185,11 @@ jobs:
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
       - name: Scan de secrets (arbre et historique)
+        id: secrets
         run: |
           set -euo pipefail
 
+          CFG=()
           if [ -f .gitleaks.toml ]; then
             # Piège vérifié sur homelab : dès qu'un [[rules]] maison existe,
             # gitleaks REMPLACE son jeu de règles par le nôtre au lieu de le
@@ -180,14 +201,71 @@ jobs:
               exit 1
             }
             echo "→ configuration du dépôt, règles par défaut incluses"
-            # --redact : le rapport nomme le fichier et la ligne, jamais la
-            # valeur. Les journaux de CI sont lisibles par qui a accès au
-            # dépôt — y recopier le secret le divulguerait une seconde fois.
-            gitleaks git --config .gitleaks.toml --redact --no-banner .
+            CFG=(--config .gitleaks.toml)
           else
             echo "→ règles par défaut de gitleaks"
-            gitleaks git --redact --no-banner .
           fi
+
+          # --redact : le rapport nomme le fichier et la ligne, jamais la
+          # valeur. Les journaux de CI sont lisibles par qui a accès au dépôt —
+          # y recopier le secret le divulguerait une seconde fois.
+          #
+          # ── DEUX scans, et les deux sont nécessaires ─────────────────────────
+          #
+          # 1. `gitleaks dir` lit l'ARBRE DE TRAVAIL. Le titre de cette étape le
+          #    promettait depuis le début ; il ne le faisait pas.
+          #
+          # 2. `gitleaks git` lit l'HISTORIQUE — mais il le lit par les patches
+          #    des commits, et `git log -p` **n'émet aucun diff pour un commit
+          #    de fusion**. Mesuré sur une fusion réelle de WYN : 0 ligne de
+          #    diff sans `-m`, 12 001 avec. Un secret arrivé par une résolution
+          #    de conflit était donc invisible. Ce n'est pas théorique sur ce
+          #    lot : LockWave-Browser porte 2 247 fusions, Artify 52, WYN 24.
+          #    `--all` ajoute les autres références — un secret sur une branche
+          #    abandonnée reste un secret.
+          #
+          # Ce que ces deux ajouts ont fait apparaître le 2026-09-19, sur des
+          # dépôts qui étaient VERTS : Artify 12 (arbre) et 28 (fusions),
+          # LockWave-Browser 3 et 28, my-memos 4, WYN 1 et 1. Tous déjà triés
+          # par ailleurs — mais aucun n'était vu.
+          #
+          # Coût mesuré sur le plus gros dépôt (9 093 commits, 2 247 fusions) :
+          # 6 s → 13 s. C'est le prix de la couverture, et il est dérisoire.
+          #
+          # ⚠ Une empreinte de .gitleaksignore vaut « commit:fichier:règle:ligne » :
+          #   celle d'un scan `dir` n'a PAS de commit, et celle d'un commit de
+          #   fusion porte le SHA de la fusion. Les trois modes produisent donc
+          #   des empreintes différentes pour le même secret — et un fichier
+          #   déplacé en produit une quatrième. Faire taire un constat demande
+          #   de régénérer les empreintes des deux commandes ci-dessous.
+          # ⚠ Ce qui peut ENCORE faire taire un constat, et qu'aucun garde-fou
+          #   ci-dessus n'attrape :
+          #     · un commentaire « gitleaks:allow » en bout de ligne, qu'un
+          #       simple commit suffit à poser ;
+          #     · une allowlist large dans .gitleaks.toml (paths, regexes,
+          #       stopwords) — le contrôle de useDefault ne regarde que les
+          #       règles, pas les exemptions ;
+          #     · les empreintes de .gitleaksignore.
+          #   Les deux premiers ne se comptent pas d'ici. Le troisième, oui — et
+          #   il est annoncé, parce qu'un vert avec 92 constats tus n'est pas le
+          #   même fait qu'un vert avec zéro.
+          TUS=0
+          [ -f .gitleaksignore ] && TUS=$(grep -cvE '^\s*(#|$)' .gitleaksignore || true)
+          echo "tus=$TUS" >> "$GITHUB_OUTPUT"
+          if [ "$TUS" -gt 0 ]; then
+            echo "ℹ $TUS constat(s) tus par .gitleaksignore — examinés à la main, pas ignorés en bloc"
+          fi
+          if [ -f .gitleaks.toml ] && grep -qE '^\s*\[\[?allowlists?\]\]?' .gitleaks.toml; then
+            echo "ℹ .gitleaks.toml porte une allowlist — ce qu'elle exempte :"
+            grep -nE '^\s*(paths|regexes|commits|stopwords|description)\s*=' .gitleaks.toml \
+              | sed 's/^/     /' || true
+          fi
+
+          echo "── arbre de travail"
+          gitleaks dir "${CFG[@]}" --redact --no-banner .
+          echo "── historique, fusions et branches comprises"
+          gitleaks git "${CFG[@]}" --log-opts="--all --full-history -m" \
+            --redact --no-banner .
 
       # ── YAML ────────────────────────────────────────────────────────────────
       - name: YAML valide et lisible
@@ -246,8 +324,13 @@ jobs:
           done < /tmp/cibles-shell.txt
 
           # -S error et non warning : ce socle doit être vert le jour de son
-          # arrivée sur quatorze dépôts écrits sur trois ans. Le niveau warning
-          # est un cliquet que chaque dépôt peut serrer chez lui.
+          # arrivée sur quatorze dépôts écrits sur trois ans.
+          # ⚠ Ce commentaire disait que « le niveau warning est un cliquet que
+          #   chaque dépôt peut serrer chez lui ». C'est faux : `-S` en ligne de
+          #   commande l'emporte sur le `severity=` d'un .shellcheckrc, donc un
+          #   dépôt ne PEUT pas serrer le cliquet — il ne peut que desserrer les
+          #   contrôles un par un avec des directives « disable » dans ses
+          #   fichiers. Pour durcir, c'est ici qu'il faut passer.
           # --source-path=SCRIPTDIR : sans lui, les `source lib/x.sh` relatifs
           # noient les vrais diagnostics sous des « Not following ».
           if [ "${#AVEC[@]}" -gt 0 ]; then
@@ -298,10 +381,54 @@ jobs:
           # appelle get_type_hints() — corrigé ainsi dans Artify.
           # Un dépôt dont le cadriciel injecte des globales (macros LibreOffice,
           # moteurs searx) les déclare dans son ruff.toml via `builtins`.
-          # --select l'emporte sur la configuration : le socle reste prévisible
-          # partout, un dépôt ne peut qu'ajouter du contexte, pas désarmer.
-          uvx ruff@0.16.2 check --no-cache \
+          #
+          # ⚠ CE COMMENTAIRE DISAIT LE CONTRAIRE, ET IL AVAIT TORT. Il affirmait
+          #   que « --select l'emporte sur la configuration, un dépôt ne peut
+          #   qu'ajouter du contexte, pas désarmer ». Mesuré avec ruff 0.16.2 sur
+          #   une vraie faute F821 :
+          #       aucune configuration        → code 1   (vu)
+          #       [lint] ignore = ["F821"]    → code 1   (vu — là c'était vrai)
+          #       exclude = ["pkg"]           → code 0   DÉSARMÉ
+          #       per-file-ignores            → code 0   DÉSARMÉ
+          #       # noqa: F821                → code 0   DÉSARMÉ
+          #   Trois voies sur quatre, dont une qu'un simple commentaire ouvre.
+          #
+          # --ignore-noqa ferme la troisième. Vérifié sur les neuf dépôts Python
+          # du lot : résultat identique avec et sans, donc aucun noqa légitime
+          # n'est sacrifié (celui d'Artify était périmé — il ne masquait plus
+          # rien). Les deux autres voies ne se ferment pas en ligne de commande :
+          # l'étape les IMPRIME, pour qu'un vert ne puisse pas se faire passer
+          # pour une couverture complète.
+          uvx ruff@0.16.2 check --no-cache --ignore-noqa \
             --select E9,F63,F7,F82 --output-format concise .
+
+      - name: Python — ce que ruff a réellement regardé
+        if: steps.inv.outputs.PY != '0'
+        run: |
+          set -euo pipefail
+          # Un « All checks passed! » ne dit pas sur COMBIEN de fichiers.
+          # Cas réel : LockWave-Browser versionne 2 141 fichiers Python, dont
+          # 1 772 dans un venv committé (venv_new/…/site-packages). Comme
+          # site-packages figure dans l'`exclude` PAR DÉFAUT de ruff, il n'en
+          # inspecte que 370 — pendant que le récapitulatif annonçait 2 141.
+          # Le chiffre n'était pas faux pour py_compile, qui prend bien la liste
+          # versionnée ; il l'était pour ruff.
+          VU=$(uvx ruff@0.16.2 check --no-cache --show-files . | grep -c . || true)
+          TOUS=${{ steps.inv.outputs.PY }}
+          echo "vu=$VU" >> "$GITHUB_OUTPUT"
+          printf '  ruff inspecte %s des %s fichiers Python versionnés\n' "$VU" "$TOUS"
+
+          if [ "$VU" -lt "$TOUS" ]; then
+            echo "  → l'écart vient des exclusions. Celles du dépôt, s'il en a :"
+            for f in ruff.toml .ruff.toml pyproject.toml setup.cfg; do
+              [ -f "$f" ] || continue
+              grep -nE '^\s*(extend-)?exclude\s*=|per-file-ignores' "$f" 2>/dev/null \
+                | sed "s|^|      $f:|" || true
+            done
+            echo "  → le reste vient des exclusions par défaut de ruff"
+            echo "    (.venv, site-packages, node_modules, build…)"
+          fi
+        id: ruff_portee
 
       # ── Configuration : un fichier cassé casse le service au démarrage ──────
       - name: JSON et TOML syntaxiquement valides
@@ -321,7 +448,11 @@ jobs:
               *.code-workspace|*tsconfig*.json|*jsconfig*.json|*.jsonc)
                 echo "── $f (dialecte à commentaires, ignoré)"; continue ;;
             esac
-            jq -e . "$f" > /dev/null 2>&1 || { echo "❌ JSON invalide — $f"; ECHECS=1; }
+            # `jq empty` et non `jq -e .` : -e fait rendre 1 quand la SORTIE
+            # vaut null ou false, si bien qu'un fichier contenant exactement
+            # « null » ou « false » — du JSON parfaitement valide — était
+            # déclaré invalide. `empty` ne juge que la syntaxe.
+            jq empty "$f" > /dev/null 2>&1 || { echo "❌ JSON invalide — $f"; ECHECS=1; }
           done < <(git ls-files '*.json')
 
           while IFS= read -r f; do
@@ -340,12 +471,29 @@ jobs:
           {
             echo "## CI de base — ${{ gitea.repository }}"
             echo ""
+            if [ "${{ steps.inv.outputs.vide }}" = "oui" ]; then
+              echo "> ⚠ **Aucun fichier de code ni de configuration versionné.**"
+              echo "> Seul le scan de secrets a quelque chose à dire ici : le vert"
+              echo "> de ce job ne veut rien dire d'autre."
+              echo ""
+            fi
             echo "| Vérification | Portée |"
             echo "|---|---|"
-            echo "| Secrets (arbre + historique) | tout le dépôt |"
+            echo "| Secrets — arbre de travail | tous les fichiers versionnés |"
+            echo "| Secrets — historique | tous les commits, **fusions et branches comprises** |"
+            if [ "${{ steps.secrets.outputs.tus }}" != "0" ]; then
+              echo "| Secrets — constats tus | ${{ steps.secrets.outputs.tus }}," \
+                   "par empreinte dans \`.gitleaksignore\` — examinés à la main |"
+            fi
             echo "| YAML | ${{ steps.inv.outputs.YAML }} fichier(s) |"
             echo "| Shell | ${{ steps.inv.outputs.SH }} fichier(s) |"
-            echo "| Python (syntaxe + ruff) | ${{ steps.inv.outputs.PY }} fichier(s) |"
+            echo "| Python — syntaxe (py_compile) | ${{ steps.inv.outputs.PY }} fichier(s) |"
+            # Deux lignes et non une : ruff n'inspecte PAS forcément tout ce que
+            # py_compile compile, et confondre les deux chiffres a déjà fait
+            # annoncer 2 141 fichiers là où 370 étaient lus.
+            echo "| Python — ruff | ${{ steps.ruff_portee.outputs.vu }} sur" \
+                 "${{ steps.inv.outputs.PY }} fichier(s) — voir l'étape « ce que ruff" \
+                 "a réellement regardé » |"
             echo "| JSON / TOML | ${{ steps.inv.outputs.JSON }} / ${{ steps.inv.outputs.TOML }} |"
             echo ""
             echo "_${{ steps.inv.outputs.total }} fichiers versionnés._"
