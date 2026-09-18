@@ -108,12 +108,22 @@ jobs:
           # justement ceux qu'un glob `*.sh` rate — et ceux qu'on exécute le
           # plus. La liste est écrite sur disque pour que l'étape shellcheck la
           # relise au lieu de refaire le parcours (5 000 fichiers sur un dépôt).
+          #
+          # ⚠ Le `if … fi` n'est pas un style, c'est une nécessité. Avec un
+          #   `grep -qE … && printf`, le statut de la boucle est celui de sa
+          #   DERNIÈRE itération : un dernier fichier en `#!/usr/bin/env python3`
+          #   la fait rendre 1, `pipefail` propage l'échec au tube entier et
+          #   `set -e` tue l'étape — sans une ligne de sortie pour l'expliquer.
+          #   C'est exactement ce qui est arrivé au premier essai sur
+          #   Automatisation-Python-Bash. Un `if` sans `else` rend 0.
           {
             git ls-files '*.sh' '*.bash'
             git ls-files | while IFS= read -r f; do
               [ -f "$f" ] || continue
               head -c 2 "$f" 2>/dev/null | grep -q '^#!' || continue
-              head -n 1 "$f" | grep -qE '(bash|/sh$|env sh)' && printf '%s\n' "$f"
+              if head -n 1 "$f" | grep -qE '(bash|/sh$|env sh)'; then
+                printf '%s\n' "$f"
+              fi
             done
           } | sort -u > /tmp/cibles-shell.txt
           SH=$(grep -c . /tmp/cibles-shell.txt || true)
