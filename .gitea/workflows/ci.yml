@@ -1,0 +1,344 @@
+# CI de base — gabarit commun à TOUS les dépôts du compte Gitea.
+#
+# ⚠ SOURCE DE VÉRITÉ : homelab/templates/ci-projets/ci.yml.
+#   Ce fichier est recopié à l'identique dans chaque dépôt par
+#   scripts/deployer-ci.sh. Corriger un défaut ICI puis rediffuser — une
+#   correction faite dans un seul dépôt fait diverger les quatorze autres et se
+#   perd au déploiement suivant.
+#
+# Ce que ce socle garantit, et rien de plus : aucun secret ne dort dans le
+# dépôt, aucun fichier de configuration n'est syntaxiquement cassé, aucun
+# script shell ne porte d'erreur avérée, aucun module Python ne refuse de se
+# compiler. Ce sont les défauts qui coûtent une soirée quand on les découvre en
+# production. Les tests métier restent propres à chaque dépôt et vivent dans un
+# second fichier, `.gitea/workflows/tests.yml`, là où ils existent.
+#
+# ── Pourquoi UN SEUL job et non sept comme dans homelab ──────────────────────
+# Le runner de la tour (homelab/services/act-runner) a une capacité de 5 jobs et
+# il est partagé par les quinze dépôts. Sept jobs par push × quinze dépôts = une
+# file d'attente permanente. Ici les étapes se détectent elles-mêmes : un dépôt
+# sans Python saute l'étape Python en une seconde, au lieu de réserver un
+# emplacement pour démarrer un conteneur et ne rien y faire.
+#
+# ── Pourquoi des SHA et pas des tags ────────────────────────────────────────
+# Un tag d'action se déplace, un SHA non. Le commentaire donne la version
+# lisible. Mêmes épinglages que homelab/.gitea/workflows/ci.yml : à changer des
+# deux côtés à la fois.
+#
+# ── Ce que l'image du runner contient (vérifié le 2026-09-18) ───────────────
+#   Python 3.12.3, Node 24.19, git, jq, curl.
+#   PAS de Go, PAS de Rust, PAS de shellcheck, PAS de yamllint,
+#   PAS de démon Docker.
+# D'où : l'outillage Python passe par `uv` (installation unique, cache compris),
+# et rien ici ne suppose un toolchain compilé. Les vérifications Go et Rust
+# demandent un téléchargement de plusieurs centaines de Mo sur le Wi-Fi de la
+# maison : elles appartiennent au `tests.yml` du dépôt concerné, pas au socle.
+
+name: CI
+
+on:
+  # Toutes les branches : une branche de travail qui casse la CI doit le dire
+  # avant la demande de fusion, pas pendant.
+  push:
+    branches: ["**"]
+  # Sans filtre `branches`, volontairement : la branche par défaut n'est pas la
+  # même partout (main, master, et même feature/… sur un dépôt). Un filtre codé
+  # en dur rendrait le gabarit faux sur une partie des dépôts.
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ gitea.ref }}
+  cancel-in-progress: true
+
+env:
+  # Le Wi-Fi de la tour plafonne à ~0,7 Mo/s : le délai par défaut d'uv (30 s)
+  # expire sur un gros paquet.
+  UV_HTTP_TIMEOUT: "180"
+  GITLEAKS_VERSION: "8.30.1"
+
+jobs:
+  verif:
+    name: Vérifications
+    runs-on: ubuntu-latest
+    # 25 min : large pour un scan d'historique long, mais sans laisser un job
+    # pendu occuper un des cinq emplacements jusqu'au timeout du runner (3 h).
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          # Historique complet : indispensable au scan de secrets. Un secret
+          # committé puis retiré reste exploitable, et c'est justement celui
+          # qu'un scan de l'arbre de travail ne voit pas.
+          fetch-depth: 0
+          # Un dépôt du lot (Audio-transcription-aed) porte un lien de
+          # sous-module orphelin — un gitlink sans .gitmodules. Tenter de le
+          # récupérer ferait échouer le checkout.
+          submodules: false
+
+      - name: Chemins de fichiers lisibles tels quels
+        run: |
+          set -euo pipefail
+          # Par défaut git ÉCHAPPE les chemins non ASCII : « Amélioration/x.sh »
+          # sort littéralement en "Am\303\251lioration/x.sh", guillemets compris.
+          # Tout outil qui reçoit cette chaîne cherche un fichier qui n'existe
+          # pas — constaté sur Automatisation-Python-Bash, où trois scripts et
+          # un JSON à nom accentué faisaient échouer shellcheck et jq pour cette
+          # seule raison. Une ligne de configuration vaut mieux que `-z` répété
+          # dans chaque étape.
+          git config core.quotePath false
+
+      - name: Inventaire du dépôt
+        id: inv
+        run: |
+          set -euo pipefail
+          # `git ls-files` et non `find` : on ne juge que ce qui est versionné.
+          # Un fichier ignoré (venv, node_modules, artefact de build) n'a pas à
+          # décider si une étape tourne.
+          compte() { git ls-files "$@" | grep -c . || true; }
+
+          YAML=$(compte '*.yml' '*.yaml')
+          JSON=$(compte '*.json')
+          TOML=$(compte '*.toml')
+          PY=$(compte '*.py')
+
+          # Shell : recherche par SHEBANG et pas seulement par extension. Les
+          # scripts sans extension (lanceurs, hooks git, scripts Termux) sont
+          # justement ceux qu'un glob `*.sh` rate — et ceux qu'on exécute le
+          # plus. La liste est écrite sur disque pour que l'étape shellcheck la
+          # relise au lieu de refaire le parcours (5 000 fichiers sur un dépôt).
+          {
+            git ls-files '*.sh' '*.bash'
+            git ls-files | while IFS= read -r f; do
+              [ -f "$f" ] || continue
+              head -c 2 "$f" 2>/dev/null | grep -q '^#!' || continue
+              head -n 1 "$f" | grep -qE '(bash|/sh$|env sh)' && printf '%s\n' "$f"
+            done
+          } | sort -u > /tmp/cibles-shell.txt
+          SH=$(grep -c . /tmp/cibles-shell.txt || true)
+
+          for v in YAML JSON TOML PY SH; do
+            eval "n=\$$v"
+            echo "$v=$n" >> "$GITHUB_OUTPUT"
+            printf '  %-5s %s fichier(s)\n' "$v" "$n"
+          done
+
+          # Un dépôt quasi vide n'est pas une erreur, mais il faut le dire :
+          # sinon une CI verte laisse croire que quelque chose a été vérifié.
+          echo "total=$(git ls-files | grep -c . || true)" >> "$GITHUB_OUTPUT"
+
+      - name: Installer uv
+        uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc  # v6.4.3
+        with:
+          enable-cache: true
+
+      # ── Secrets ─────────────────────────────────────────────────────────────
+      # En premier, avant toute installation lourde : si un secret traîne dans
+      # l'historique, c'est l'information la plus urgente du job et elle ne doit
+      # pas attendre neuf minutes de lint.
+      - name: Cache gitleaks
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ~/bin/gitleaks
+          key: gitleaks-${{ env.GITLEAKS_VERSION }}
+
+      - name: Installer gitleaks (épinglé)
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          if [ ! -x "$HOME/bin/gitleaks" ]; then
+            curl -fsSL --retry 3 --retry-delay 5 -o /tmp/gitleaks.tgz \
+              "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+            tar -xzf /tmp/gitleaks.tgz -C "$HOME/bin" gitleaks
+            chmod +x "$HOME/bin/gitleaks"
+          fi
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Scan de secrets (arbre et historique)
+        run: |
+          set -euo pipefail
+
+          if [ -f .gitleaks.toml ]; then
+            # Piège vérifié sur homelab : dès qu'un [[rules]] maison existe,
+            # gitleaks REMPLACE son jeu de règles par le nôtre au lieu de le
+            # compléter. Une clé AWS ou un jeton GitHub passeraient alors sans
+            # être vus — avec un scan qui reste vert.
+            grep -qE '^\s*useDefault\s*=\s*true' .gitleaks.toml || {
+              echo "❌ [extend] useDefault = true absent de .gitleaks.toml"
+              echo "   Le scan resterait vert en n'appliquant plus que les règles maison."
+              exit 1
+            }
+            echo "→ configuration du dépôt, règles par défaut incluses"
+            # --redact : le rapport nomme le fichier et la ligne, jamais la
+            # valeur. Les journaux de CI sont lisibles par qui a accès au
+            # dépôt — y recopier le secret le divulguerait une seconde fois.
+            gitleaks git --config .gitleaks.toml --redact --no-banner .
+          else
+            echo "→ règles par défaut de gitleaks"
+            gitleaks git --redact --no-banner .
+          fi
+
+      # ── YAML ────────────────────────────────────────────────────────────────
+      - name: YAML valide et lisible
+        if: steps.inv.outputs.YAML != '0'
+        run: |
+          set -euo pipefail
+          # Configuration du dépôt si elle existe, sinon un jeu volontairement
+          # indulgent : ce socle refuse ce qui est CASSÉ, il n'impose pas un
+          # style. Un dépôt qui veut plus strict pose son .yamllint.yml.
+          if [ -f .yamllint.yml ] || [ -f .yamllint.yaml ] || [ -f .yamllint ]; then
+            echo "→ configuration du dépôt"
+            git ls-files -z '*.yml' '*.yaml' | xargs -0 --no-run-if-empty \
+              uvx yamllint==1.37.1 --
+          else
+            echo "→ configuration par défaut du gabarit (relaxed)"
+            printf '%s\n' \
+              'extends: relaxed' \
+              'rules:' \
+              '  line-length: disable' \
+              '  trailing-spaces: disable' \
+              '  comments-indentation: disable' \
+              '  comments: disable' \
+              '  empty-lines: disable' \
+              '  document-start: disable' \
+              '  indentation: disable' \
+              '  truthy:' \
+              "    allowed-values: ['true', 'false', 'on', 'off']" \
+              > /tmp/yamllint.yml
+            # `on:` d'un workflow est la valeur booléenne « on » pour YAML :
+            # sans l'exception ci-dessus, tout workflow est signalé à tort.
+            git ls-files -z '*.yml' '*.yaml' | xargs -0 --no-run-if-empty \
+              uvx yamllint==1.37.1 -c /tmp/yamllint.yml --
+          fi
+
+      # ── Shell ───────────────────────────────────────────────────────────────
+      - name: Scripts shell sans erreur avérée
+        if: steps.inv.outputs.SH != '0'
+        run: |
+          set -euo pipefail
+          # shellcheck-py embarque le binaire : l'image du runner n'a pas
+          # shellcheck, et apt-get ajouterait une minute par job.
+          SC="uvx --from shellcheck-py==0.10.0.1 shellcheck"
+
+          # Deux lots, et c'est nécessaire : un fichier .sh SANS shebang — une
+          # bibliothèque de fonctions destinée à être sourcée — déclenche
+          # SC2148 « your shell is unknown », classé *error*. Le signaler serait
+          # exiger un shebang sur un fichier qu'on ne lance jamais. On lui
+          # impose donc le dialecte bash (-s bash) au lieu de le refuser.
+          # Conséquence assumée : un fichier sourcé prévu pour /bin/sh serait
+          # analysé en bash, donc un bashisme y passerait inaperçu. C'est le
+          # sens du compromis : ce socle refuse ce qui est cassé.
+          AVEC=(); SANS=()
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if head -c 2 "$f" 2>/dev/null | grep -q '^#!'; then AVEC+=("$f"); else SANS+=("$f"); fi
+          done < /tmp/cibles-shell.txt
+
+          # -S error et non warning : ce socle doit être vert le jour de son
+          # arrivée sur quatorze dépôts écrits sur trois ans. Le niveau warning
+          # est un cliquet que chaque dépôt peut serrer chez lui.
+          # --source-path=SCRIPTDIR : sans lui, les `source lib/x.sh` relatifs
+          # noient les vrais diagnostics sous des « Not following ».
+          if [ "${#AVEC[@]}" -gt 0 ]; then
+            printf '── %s\n' "${AVEC[@]}"
+            $SC -S error -x --source-path=SCRIPTDIR "${AVEC[@]}"
+          fi
+          if [ "${#SANS[@]}" -gt 0 ]; then
+            printf '── %s (sans shebang, analysé en bash)\n' "${SANS[@]}"
+            $SC -S error -x -s bash --source-path=SCRIPTDIR "${SANS[@]}"
+          fi
+
+      # ── Python ──────────────────────────────────────────────────────────────
+      - name: Python se compile
+        if: steps.inv.outputs.PY != '0'
+        run: |
+          set -euo pipefail
+          # py_compile sur la LISTE VERSIONNÉE, pas compileall sur les
+          # répertoires : compileall entrerait dans les venv et les caches et
+          # échouerait sur du code qui n'est pas au dépôt.
+          #
+          # Aucune dépendance n'est installée : on vérifie la syntaxe, pas les
+          # imports. Installer les dépendances de quatorze dépôts dans un socle
+          # commun serait plus long que tout le reste réuni.
+          git ls-files -z '*.py' | xargs -0 --no-run-if-empty \
+            python3 -m py_compile
+          echo "✅ ${{ steps.inv.outputs.PY }} fichier(s) Python compilés"
+
+      - name: Python — fautes qui cassent à l'exécution (ruff)
+        if: steps.inv.outputs.PY != '0'
+        run: |
+          set -euo pipefail
+          # Jeu de règles EXPLICITE et étroit, à l'opposé des défauts de ruff.
+          # Raison mesurée : ruff 0.16 a élargi ses défauts, et sur homelab ils
+          # donnaient 21 erreurs de style sur du code qui tourne en production
+          # depuis des mois. Un socle qui arrive rouge, personne ne le lit.
+          #   E9   erreurs de syntaxe et d'indentation
+          #   F63  comparaison toujours vraie ou toujours fausse
+          #   F7   break/continue hors boucle, return hors fonction
+          #   F82  nom indéfini — la faute de frappe qui lève NameError
+          # F811 (redéfinition) a été essayé puis RETIRÉ : il se déclenche sur
+          # le motif normal des fixtures pytest (un paramètre porte le nom de la
+          # fixture définie plus haut dans le module) — sept faux positifs sur
+          # Automatisation-Python-Bash, aucun vrai.
+          #
+          # F821 trouve en revanche de vraies fautes, y compris latentes : une
+          # annotation en chaîne « result: "ConversionResult" » dont le type
+          # n'est pas importé ne casse rien jusqu'au jour où quelque chose
+          # appelle get_type_hints() — corrigé ainsi dans Artify.
+          # Un dépôt dont le cadriciel injecte des globales (macros LibreOffice,
+          # moteurs searx) les déclare dans son ruff.toml via `builtins`.
+          # --select l'emporte sur la configuration : le socle reste prévisible
+          # partout, un dépôt ne peut qu'ajouter du contexte, pas désarmer.
+          uvx ruff@0.16.2 check --no-cache \
+            --select E9,F63,F7,F82 --output-format concise .
+
+      # ── Configuration : un fichier cassé casse le service au démarrage ──────
+      - name: JSON et TOML syntaxiquement valides
+        if: steps.inv.outputs.JSON != '0' || steps.inv.outputs.TOML != '0'
+        run: |
+          set -euo pipefail
+          ECHECS=0
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            # Dialectes à commentaires : jq les refuse à juste titre, ce ne
+            # sont pas du JSON. Les exclure vaut mieux qu'un faux échec.
+            # `.vscode/` en entier : launch.json et tasks.json sont du JSONC
+            # tout autant que settings.json, et VS Code les accepte ainsi.
+            case "$f" in
+              .vscode/*|*/.vscode/*|.devcontainer/*|*/.devcontainer/*) \
+                echo "── $f (JSONC d'éditeur, ignoré)"; continue ;;
+              *.code-workspace|*tsconfig*.json|*jsconfig*.json|*.jsonc)
+                echo "── $f (dialecte à commentaires, ignoré)"; continue ;;
+            esac
+            jq -e . "$f" > /dev/null 2>&1 || { echo "❌ JSON invalide — $f"; ECHECS=1; }
+          done < <(git ls-files '*.json')
+
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            python3 -c 'import sys,tomllib;tomllib.load(open(sys.argv[1],"rb"))' "$f" \
+              || { echo "❌ TOML invalide — $f"; ECHECS=1; }
+          done < <(git ls-files '*.toml')
+
+          [ "$ECHECS" -eq 0 ] && echo "✅ configuration valide"
+          exit "$ECHECS"
+
+      # ── Bilan ───────────────────────────────────────────────────────────────
+      - name: Récapitulatif
+        if: always()
+        run: |
+          {
+            echo "## CI de base — ${{ gitea.repository }}"
+            echo ""
+            echo "| Vérification | Portée |"
+            echo "|---|---|"
+            echo "| Secrets (arbre + historique) | tout le dépôt |"
+            echo "| YAML | ${{ steps.inv.outputs.YAML }} fichier(s) |"
+            echo "| Shell | ${{ steps.inv.outputs.SH }} fichier(s) |"
+            echo "| Python (syntaxe + ruff) | ${{ steps.inv.outputs.PY }} fichier(s) |"
+            echo "| JSON / TOML | ${{ steps.inv.outputs.JSON }} / ${{ steps.inv.outputs.TOML }} |"
+            echo ""
+            echo "_${{ steps.inv.outputs.total }} fichiers versionnés._"
+            echo "Ce socle ne lance **aucun test métier** : ceux-ci vivent dans"
+            echo "\`.gitea/workflows/tests.yml\` sur les dépôts qui en ont."
+          } >> "$GITHUB_STEP_SUMMARY"
